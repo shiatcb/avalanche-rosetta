@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: 
+    branches:
       - master
   pull_request:
 
 env:
-  go_version: 1.17
+  go_version: '~1.19.12'
 
 jobs:
   Build:

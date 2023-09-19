@@ -11,17 +11,17 @@ DOCKER_ORG          ?= avaplatform
 DOCKER_IMAGE        ?= ${DOCKER_ORG}/${PROJECT}
 DOCKER_LABEL        ?= latest
 DOCKER_TAG          ?= ${DOCKER_IMAGE}:${DOCKER_LABEL}
-AVALANCHE_VERSION   ?= v1.7.13
+AVALANCHE_VERSION   ?= v1.10.9
 
 build:
-	go build -o ./rosetta-server ./cmd/server
-	go build -o ./rosetta-runner ./cmd/runner
+	export CGO_CFLAGS="-O -D__BLST_PORTABLE__" && go build -o ./rosetta-server ./cmd/server
+	export CGO_CFLAGS="-O -D__BLST_PORTABLE__" && go build -o ./rosetta-runner ./cmd/runner
 
 setup:
 	go mod download
 
 test:
-	go test -v -cover -race ./...
+	export CGO_CFLAGS="-O -D__BLST_PORTABLE__" && go test -v -cover -race ./...
 
 docker-build:
 	docker build \
@@ -99,9 +99,13 @@ check-testnet-data:
 check-testnet-construction:
 	rosetta-cli check:construction --configuration-file=rosetta-cli-conf/testnet/config.json
 
-# Perform the Testnet construction check for ERC-20s
+# Perform the Testnet construction check for ERC-20 transfers
 check-testnet-construction-erc20:
 	rosetta-cli check:construction --configuration-file=rosetta-cli-conf/testnet/config_erc20.json
+
+# Perform the Testnet construction check for unwrap bridge tokens
+check-testnet-construction-unwrap:
+	rosetta-cli check:construction --configuration-file=rosetta-cli-conf/testnet/config_unwrap.json
 
 # Perform the Mainnet data check
 check-mainnet-data:
@@ -114,3 +118,6 @@ check-mainnet-construction:
 mocks:
 	rm -rf mocks;
 	mockery --dir client --all --case underscore --outpkg client --output mocks/client;
+	mockery --dir service --name '.*Backend' --case underscore --outpkg chain --output mocks/service;
+	mockery --dir service/backend --all --case underscore --outpkg chain --output mocks/service/backend;
+	mockery --dir service/backend/pchain/indexer --all --case underscore --outpkg chain --output mocks/service/backend/pchain/indexer;

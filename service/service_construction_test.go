@@ -7,13 +7,18 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/ava-labs/avalanche-rosetta/mapper"
-	mocks "github.com/ava-labs/avalanche-rosetta/mocks/client"
+	"github.com/stretchr/testify/mock"
+
 	"github.com/ava-labs/coreth/interfaces"
 
 	"github.com/coinbase/rosetta-sdk-go/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/assert"
+
+	rosConst "github.com/ava-labs/avalanche-rosetta/constants"
+	"github.com/ava-labs/avalanche-rosetta/mapper"
+	mocks "github.com/ava-labs/avalanche-rosetta/mocks/client"
+	backendMocks "github.com/ava-labs/avalanche-rosetta/mocks/service"
 )
 
 const (
@@ -27,9 +32,14 @@ const (
 func TestConstructionMetadata(t *testing.T) {
 	client := &mocks.Client{}
 	ctx := context.Background()
+	skippedBackend := &backendMocks.ConstructionBackend{}
+	skippedBackend.On("ShouldHandleRequest", mock.Anything).Return(false)
+
 	service := ConstructionService{
-		config: &Config{Mode: ModeOnline},
-		client: client,
+		config:                &Config{Mode: ModeOnline},
+		client:                client,
+		pChainBackend:         skippedBackend,
+		cChainAtomicTxBackend: skippedBackend,
 	}
 
 	t.Run("unavailable in offline mode", func(t *testing.T) {
@@ -44,7 +54,7 @@ func TestConstructionMetadata(t *testing.T) {
 			&types.ConstructionMetadataRequest{},
 		)
 		assert.Nil(t, resp)
-		assert.Equal(t, errUnavailableOffline.Code, err.Code)
+		assert.Equal(t, ErrUnavailableOffline.Code, err.Code)
 	})
 
 	t.Run("requires from address", func(t *testing.T) {
@@ -53,7 +63,7 @@ func TestConstructionMetadata(t *testing.T) {
 			&types.ConstructionMetadataRequest{},
 		)
 		assert.Nil(t, resp)
-		assert.Equal(t, errInvalidInput.Code, err.Code)
+		assert.Equal(t, ErrInvalidInput.Code, err.Code)
 		assert.Equal(t, "from address is not provided", err.Details["error"])
 	})
 
@@ -87,7 +97,11 @@ func TestConstructionMetadata(t *testing.T) {
 			uint64(21001),
 			nil,
 		).Once()
-		input := map[string]interface{}{"from": "0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309", "to": "0x57B414a0332B5CaB885a451c2a28a07d1e9b8a8d", "value": "0x9864aac3510d02"}
+		input := map[string]interface{}{
+			"from":  "0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309",
+			"to":    "0x57B414a0332B5CaB885a451c2a28a07d1e9b8a8d",
+			"value": "0x9864aac3510d02",
+		}
 		resp, err := service.ConstructionMetadata(
 			ctx,
 			&types.ConstructionMetadataRequest{
@@ -99,6 +113,79 @@ func TestConstructionMetadata(t *testing.T) {
 			GasPrice: big.NewInt(1000000000),
 			GasLimit: 21_001,
 			Nonce:    0,
+		}
+		assert.Equal(t, &types.ConstructionMetadataResponse{
+			Metadata: forceMarshalMap(t, metadata),
+			SuggestedFee: []*types.Amount{
+				{
+					Value:    "21001000000000",
+					Currency: mapper.AvaxCurrency,
+				},
+			},
+		}, resp)
+	})
+	t.Run("basic unwrap transfer", func(t *testing.T) {
+		contractAddress := common.HexToAddress(defaultContractAddress)
+		client.On(
+			"NonceAt",
+			ctx,
+			common.HexToAddress(defaultFromAddress),
+			(*big.Int)(nil),
+		).Return(
+			uint64(0),
+			nil,
+		).Once()
+		client.On(
+			"SuggestGasPrice",
+			ctx,
+		).Return(
+			big.NewInt(1000000000),
+			nil,
+		).Once()
+		client.On(
+			"EstimateGas",
+			ctx,
+			interfaces.CallMsg{
+				From: common.HexToAddress(defaultFromAddress),
+				To:   &contractAddress,
+				Data: common.Hex2Bytes(
+					"6e28667100000000000000000000000000000000000000000000000000000000b4d360e30000000000000000000000000000000000000000000000000000000000000000",
+				),
+			},
+		).Return(
+			uint64(21001),
+			nil,
+		).Once()
+		currencyMetadata := map[string]interface{}{
+			"contractAddress": defaultContractAddress,
+		}
+		currency := map[string]interface{}{
+			"symbol":   defaultSymbol,
+			"decimals": defaultDecimals,
+			"metadata": currencyMetadata,
+		}
+		inputMetadata := map[string]interface{}{
+			"bridge_unwrap": true,
+		}
+		input := map[string]interface{}{
+			"from":     defaultFromAddress,
+			"to":       "0x920eb8ca79f07eb3bfc39c324c8113948ed3104c",
+			"value":    "0xb4d360e3",
+			"currency": currency,
+			"metadata": inputMetadata,
+		}
+		resp, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				Options: input,
+			},
+		)
+		assert.Nil(t, err)
+		metadata := &metadata{
+			GasPrice:       big.NewInt(1000000000),
+			GasLimit:       21_001,
+			Nonce:          0,
+			UnwrapBridgeTx: true,
 		}
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -134,7 +221,9 @@ func TestConstructionMetadata(t *testing.T) {
 			interfaces.CallMsg{
 				From: common.HexToAddress(defaultFromAddress),
 				To:   &contractAddress,
-				Data: common.Hex2Bytes("a9059cbb000000000000000000000000920eb8ca79f07eb3bfc39c324c8113948ed3104c00000000000000000000000000000000000000000000000000000000b4d360e3"),
+				Data: common.Hex2Bytes(
+					"a9059cbb000000000000000000000000920eb8ca79f07eb3bfc39c324c8113948ed3104c00000000000000000000000000000000000000000000000000000000b4d360e3",
+				),
 			},
 		).Return(
 			uint64(21001),
@@ -148,7 +237,12 @@ func TestConstructionMetadata(t *testing.T) {
 			"decimals": defaultDecimals,
 			"metadata": currencyMetadata,
 		}
-		input := map[string]interface{}{"from": defaultFromAddress, "to": "0x920eb8ca79f07eb3bfc39c324c8113948ed3104c", "value": "0xb4d360e3", "currency": currency}
+		input := map[string]interface{}{
+			"from":     defaultFromAddress,
+			"to":       "0x920eb8ca79f07eb3bfc39c324c8113948ed3104c",
+			"value":    "0xb4d360e3",
+			"currency": currency,
+		}
 		resp, err := service.ConstructionMetadata(
 			ctx,
 			&types.ConstructionMetadataRequest{
@@ -174,7 +268,13 @@ func TestConstructionMetadata(t *testing.T) {
 }
 
 func TestContructionHash(t *testing.T) {
-	service := ConstructionService{}
+	skippedBackend := &backendMocks.ConstructionBackend{}
+	skippedBackend.On("ShouldHandleRequest", mock.Anything).Return(false)
+
+	service := ConstructionService{
+		pChainBackend:         skippedBackend,
+		cChainAtomicTxBackend: skippedBackend,
+	}
 
 	t.Run("no transaction", func(t *testing.T) {
 		resp, err := service.ConstructionHash(
@@ -182,7 +282,7 @@ func TestContructionHash(t *testing.T) {
 			&types.ConstructionHashRequest{},
 		)
 		assert.Nil(t, resp)
-		assert.Equal(t, errInvalidInput.Code, err.Code)
+		assert.Equal(t, ErrInvalidInput.Code, err.Code)
 		assert.Equal(t, "signed transaction value is not provided", err.Details["error"])
 	})
 
@@ -191,7 +291,7 @@ func TestContructionHash(t *testing.T) {
 			SignedTransaction: "{}",
 		})
 		assert.Nil(t, resp)
-		assert.Equal(t, errInvalidInput.Code, err.Code)
+		assert.Equal(t, ErrInvalidInput.Code, err.Code)
 	})
 
 	t.Run("valid transaction", func(t *testing.T) {
@@ -238,7 +338,12 @@ func TestContructionHash(t *testing.T) {
 }
 
 func TestConstructionDerive(t *testing.T) {
-	service := ConstructionService{}
+	skippedBackend := &backendMocks.ConstructionBackend{}
+	skippedBackend.On("ShouldHandleRequest", mock.Anything).Return(false)
+	service := ConstructionService{
+		pChainBackend:         skippedBackend,
+		cChainAtomicTxBackend: skippedBackend,
+	}
 
 	t.Run("no public key", func(t *testing.T) {
 		resp, err := service.ConstructionDerive(
@@ -246,7 +351,7 @@ func TestConstructionDerive(t *testing.T) {
 			&types.ConstructionDeriveRequest{},
 		)
 		assert.Nil(t, resp)
-		assert.Equal(t, errInvalidInput.Code, err.Code)
+		assert.Equal(t, ErrInvalidInput.Code, err.Code)
 		assert.Equal(t, "public key is not provided", err.Details["error"])
 	})
 
@@ -261,7 +366,7 @@ func TestConstructionDerive(t *testing.T) {
 			},
 		)
 		assert.Nil(t, resp)
-		assert.Equal(t, errInvalidInput.Code, err.Code)
+		assert.Equal(t, ErrInvalidInput.Code, err.Code)
 		assert.Equal(t, "invalid public key", err.Details["error"])
 	})
 
@@ -288,7 +393,7 @@ func TestConstructionDerive(t *testing.T) {
 }
 
 func forceMarshalMap(t *testing.T, i interface{}) map[string]interface{} {
-	m, err := marshalJSONMap(i)
+	m, err := mapper.MarshalJSONMap(i)
 	if err != nil {
 		t.Fatalf("could not marshal map %s", types.PrintStruct(i))
 	}
@@ -300,12 +405,16 @@ func TestPreprocessMetadata(t *testing.T) {
 	ctx := context.Background()
 	client := &mocks.Client{}
 	networkIdentifier := &types.NetworkIdentifier{
-		Network:    "Fuji",
+		Network:    rosConst.FujiNetwork,
 		Blockchain: "Avalanche",
 	}
+	skippedBackend := &backendMocks.ConstructionBackend{}
+	skippedBackend.On("ShouldHandleRequest", mock.Anything).Return(false)
 	service := ConstructionService{
-		config: &Config{Mode: ModeOnline},
-		client: client,
+		config:                &Config{Mode: ModeOnline},
+		client:                client,
+		pChainBackend:         skippedBackend,
+		cChainAtomicTxBackend: skippedBackend,
 	}
 	intent := `[{"operation_identifier":{"index":0},"type":"CALL","account":{"address":"0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309"},"amount":{"value":"-42894881044106498","currency":{"symbol":"AVAX","decimals":18}}},{"operation_identifier":{"index":1},"type":"CALL","account":{"address":"0x57B414a0332B5CaB885a451c2a28a07d1e9b8a8d"},"amount":{"value":"42894881044106498","currency":{"symbol":"AVAX","decimals":18}}}]`
 	t.Run("currency info doesn't match between the operations", func(t *testing.T) {
@@ -376,10 +485,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			uint64(0),
 			nil,
 		).Once()
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -422,10 +534,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			uint64(0),
 			nil,
 		).Once()
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -487,10 +602,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			uint64(0),
 			nil,
 		).Once()
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -554,10 +672,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			uint64(0),
 			nil,
 		).Once()
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -625,10 +746,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			uint64(0),
 			nil,
 		).Once()
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -690,10 +814,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			big.NewInt(1000000000),
 			nil,
 		).Once()
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -751,10 +878,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			uint64(0),
 			nil,
 		).Once()
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -772,8 +902,10 @@ func TestPreprocessMetadata(t *testing.T) {
 		tokenList := []string{defaultContractAddress}
 
 		service := ConstructionService{
-			config: &Config{Mode: ModeOnline, TokenWhiteList: tokenList},
-			client: client,
+			config:                &Config{Mode: ModeOnline, TokenWhiteList: tokenList},
+			client:                client,
+			pChainBackend:         skippedBackend,
+			cChainAtomicTxBackend: skippedBackend,
 		}
 		currency := &types.Currency{Symbol: defaultSymbol, Decimals: defaultDecimals}
 		client.On(
@@ -821,7 +953,9 @@ func TestPreprocessMetadata(t *testing.T) {
 			interfaces.CallMsg{
 				From: common.HexToAddress("0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309"),
 				To:   &contractAddress,
-				Data: common.Hex2Bytes("a9059cbb00000000000000000000000057B414a0332B5CaB885a451c2a28a07d1e9b8a8d000000000000000000000000000000000000000000000000009864aac3510d02"),
+				Data: common.Hex2Bytes(
+					"a9059cbb00000000000000000000000057B414a0332B5CaB885a451c2a28a07d1e9b8a8d000000000000000000000000000000000000000000000000009864aac3510d02",
+				),
 			},
 		).Return(
 			uint64(21001),
@@ -837,10 +971,13 @@ func TestPreprocessMetadata(t *testing.T) {
 			nil,
 		).Once()
 
-		metadataResponse, err := service.ConstructionMetadata(ctx, &types.ConstructionMetadataRequest{
-			NetworkIdentifier: networkIdentifier,
-			Options:           forceMarshalMap(t, &opt),
-		})
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
 		assert.Nil(t, err)
 		assert.Equal(t, &types.ConstructionMetadataResponse{
 			Metadata: forceMarshalMap(t, metadata),
@@ -852,4 +989,272 @@ func TestPreprocessMetadata(t *testing.T) {
 			},
 		}, metadataResponse)
 	})
+
+	t.Run("basic unwrap flow", func(t *testing.T) {
+		unwrapIntent := `[{"operation_identifier":{"index":0},"type":"ERC20_BURN","account":{"address":"0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309"},"amount":{"value":"-42894881044106498","currency":{"symbol":"TEST","decimals":18, "metadata": {"contractAddress": "0x30e5449b6712Adf4156c8c474250F6eA4400eB82"}}}}]`
+		bridgeTokenList := []string{defaultContractAddress}
+		skippedBackend := &backendMocks.ConstructionBackend{}
+		skippedBackend.On("ShouldHandleRequest", mock.Anything).Return(false)
+
+		service := ConstructionService{
+			config: &Config{
+				Mode:            ModeOnline,
+				BridgeTokenList: bridgeTokenList,
+			},
+			client:                client,
+			pChainBackend:         skippedBackend,
+			cChainAtomicTxBackend: skippedBackend,
+		}
+		currency := &types.Currency{Symbol: defaultSymbol, Decimals: defaultDecimals}
+		client.On(
+			"ContractInfo",
+			common.HexToAddress(defaultContractAddress),
+			true,
+		).Return(
+			currency,
+			nil,
+		).Once()
+		var ops []*types.Operation
+		assert.NoError(t, json.Unmarshal([]byte(unwrapIntent), &ops))
+
+		requestMetadata := map[string]interface{}{
+			"bridge_unwrap": true,
+		}
+		preprocessResponse, err := service.ConstructionPreprocess(
+			ctx,
+			&types.ConstructionPreprocessRequest{
+				NetworkIdentifier: networkIdentifier,
+				Operations:        ops,
+				Metadata:          requestMetadata,
+			},
+		)
+		assert.Nil(t, err)
+		optionsRaw := `{"metadata": {"bridge_unwrap":true}, "from":"0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309","value":"0x9864aac3510d02", "currency":{"symbol":"TEST","decimals":18, "metadata": {"contractAddress": "0x30e5449b6712Adf4156c8c474250F6eA4400eB82"}}}`
+		var opt options
+		assert.NoError(t, json.Unmarshal([]byte(optionsRaw), &opt))
+		assert.Equal(t, &types.ConstructionPreprocessResponse{
+			Options: forceMarshalMap(t, &opt),
+		}, preprocessResponse)
+
+		metadata := &metadata{
+			GasPrice:       big.NewInt(1000000000),
+			GasLimit:       21_001,
+			Nonce:          0,
+			UnwrapBridgeTx: true,
+		}
+
+		client.On(
+			"SuggestGasPrice",
+			ctx,
+		).Return(
+			big.NewInt(1000000000),
+			nil,
+		).Once()
+		contractAddress := common.HexToAddress(defaultContractAddress)
+		client.On(
+			"EstimateGas",
+			ctx,
+			interfaces.CallMsg{
+				From: common.HexToAddress("0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309"),
+				To:   &contractAddress,
+				Data: common.Hex2Bytes(
+					"6e286671000000000000000000000000000000000000000000000000009864aac3510d020000000000000000000000000000000000000000000000000000000000000000",
+				),
+			},
+		).Return(
+			uint64(21001),
+			nil,
+		).Once()
+		client.On(
+			"NonceAt",
+			ctx,
+			common.HexToAddress("0xe3a5B4d7f79d64088C8d4ef153A7DDe2B2d47309"),
+			(*big.Int)(nil),
+		).Return(
+			uint64(0),
+			nil,
+		).Once()
+
+		metadataResponse, err := service.ConstructionMetadata(
+			ctx,
+			&types.ConstructionMetadataRequest{
+				NetworkIdentifier: networkIdentifier,
+				Options:           forceMarshalMap(t, &opt),
+			},
+		)
+		assert.Nil(t, err)
+		assert.Equal(t, &types.ConstructionMetadataResponse{
+			Metadata: forceMarshalMap(t, metadata),
+			SuggestedFee: []*types.Amount{
+				{
+					Value:    "21001000000000",
+					Currency: mapper.AvaxCurrency,
+				},
+			},
+		}, metadataResponse)
+	})
+}
+
+func TestBackendDelegations(t *testing.T) {
+	testCases := []string{
+		"p-chain",
+		"c-chain-atomic-tx",
+	}
+
+	makeBackends := func(currentBackend int) []*backendMocks.ConstructionBackend {
+		backends := make([]*backendMocks.ConstructionBackend, len(testCases))
+		for i := range backends {
+			backends[i] = &backendMocks.ConstructionBackend{}
+
+			if i == currentBackend {
+				backends[i].On("ShouldHandleRequest", mock.Anything).Return(true)
+				break
+			}
+
+			backends[i].On("ShouldHandleRequest", mock.Anything).Return(false)
+		}
+		return backends
+	}
+
+	assertBackendCalls := func(backends []*backendMocks.ConstructionBackend) {
+		for _, b := range backends {
+			if b != nil {
+				b.AssertExpectations(t)
+			}
+		}
+	}
+
+	for idx, backendName := range testCases {
+		backends := makeBackends(idx)
+
+		offlineService := ConstructionService{
+			config:                &Config{Mode: ModeOffline},
+			pChainBackend:         backends[0],
+			cChainAtomicTxBackend: backends[1],
+		}
+
+		onlineService := ConstructionService{
+			config:                &Config{Mode: ModeOnline},
+			pChainBackend:         backends[0],
+			cChainAtomicTxBackend: backends[1],
+		}
+
+		t.Run("Derive request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionDeriveRequest{
+				PublicKey: &types.PublicKey{},
+			}
+
+			expectedResp := &types.ConstructionDeriveResponse{
+				AccountIdentifier: &types.AccountIdentifier{
+					Address: "P-fuji15f9g0h5xkr5cp47n6u3qxj6yjtzzzrdr23a3tl",
+				},
+			}
+
+			backends[idx].On("ConstructionDerive", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := offlineService.ConstructionDerive(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+
+		t.Run("Preprocess request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionPreprocessRequest{}
+
+			expectedResp := &types.ConstructionPreprocessResponse{
+				Options: map[string]interface{}{"key": "value"},
+			}
+
+			backends[idx].On("ConstructionPreprocess", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := offlineService.ConstructionPreprocess(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+
+		t.Run("Metadata request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionMetadataRequest{}
+
+			expectedResp := &types.ConstructionMetadataResponse{
+				Metadata: map[string]interface{}{"key": "value"},
+			}
+
+			backends[idx].On("ConstructionMetadata", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := onlineService.ConstructionMetadata(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+
+		t.Run("Payloads request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionPayloadsRequest{}
+
+			expectedResp := &types.ConstructionPayloadsResponse{UnsignedTransaction: "unsignedtxn"}
+
+			backends[idx].On("ConstructionPayloads", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := offlineService.ConstructionPayloads(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+
+		t.Run("Combine request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionCombineRequest{
+				UnsignedTransaction: "unsignedtxn",
+				Signatures:          []*types.Signature{{}},
+			}
+
+			expectedResp := &types.ConstructionCombineResponse{SignedTransaction: "unsignedtxn"}
+
+			backends[idx].On("ConstructionCombine", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := offlineService.ConstructionCombine(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+
+		t.Run("Parse request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionParseRequest{}
+			expectedResp := &types.ConstructionParseResponse{}
+
+			backends[idx].On("ConstructionParse", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := offlineService.ConstructionParse(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+
+		t.Run("Hash request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionHashRequest{SignedTransaction: "signedtxn"}
+			expectedResp := &types.TransactionIdentifierResponse{
+				TransactionIdentifier: &types.TransactionIdentifier{Hash: "txn hash"},
+			}
+
+			backends[idx].On("ConstructionHash", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := offlineService.ConstructionHash(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+
+		t.Run("Submit request is delegated to "+backendName, func(t *testing.T) {
+			req := &types.ConstructionSubmitRequest{SignedTransaction: "signedtxn"}
+			expectedResp := &types.TransactionIdentifierResponse{
+				TransactionIdentifier: &types.TransactionIdentifier{Hash: "txn hash"},
+			}
+
+			backends[idx].On("ConstructionSubmit", mock.Anything, req).Return(expectedResp, nil).Once()
+			resp, err := onlineService.ConstructionSubmit(context.Background(), req)
+
+			assert.Nil(t, err)
+			assert.Equal(t, expectedResp, resp)
+			assertBackendCalls(backends)
+		})
+	}
 }
